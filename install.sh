@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # Default panel credentials
 XUI_USERNAME="${XUI_USERNAME:-admin}"
@@ -7,13 +7,15 @@ XUI_PASSWORD="${XUI_PASSWORD:-admin123}"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/3x-ui}"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+SUDO=""
+COMPOSE_CMD=""
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
 need_root_or_sudo() {
-  if [[ "${EUID}" -ne 0 ]]; then
+  if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
       SUDO="sudo"
     else
@@ -39,7 +41,7 @@ install_docker() {
   fi
 
   # Prefer docker compose plugin; fall back to docker-compose binary if present
-  if docker compose version >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1 || ${SUDO} docker compose version >/dev/null 2>&1; then
     COMPOSE_CMD="docker compose"
   elif command -v docker-compose >/dev/null 2>&1; then
     COMPOSE_CMD="docker-compose"
@@ -47,7 +49,7 @@ install_docker() {
     log "Docker Compose not found. Installing compose plugin..."
     ${SUDO} apt-get update -y >/dev/null 2>&1 || true
     ${SUDO} apt-get install -y docker-compose-plugin >/dev/null 2>&1 || true
-    if docker compose version >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1 || ${SUDO} docker compose version >/dev/null 2>&1; then
       COMPOSE_CMD="docker compose"
     else
       echo "Failed to install Docker Compose." >&2
@@ -56,13 +58,14 @@ install_docker() {
   fi
 
   # Allow current user to run docker without sudo (best-effort)
-  if [[ "${EUID}" -ne 0 ]] && ! groups | grep -qw docker; then
-    ${SUDO} usermod -aG docker "$USER" || true
-    log "Added $USER to docker group. You may need to re-login for it to take effect."
-    # Use sudo for compose in this session
-    COMPOSE_CMD="${SUDO} ${COMPOSE_CMD}"
-  elif [[ "${EUID}" -ne 0 ]] && ! docker info >/dev/null 2>&1; then
-    COMPOSE_CMD="${SUDO} ${COMPOSE_CMD}"
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! groups | grep -qw docker; then
+      ${SUDO} usermod -aG docker "$USER" || true
+      log "Added $USER to docker group. You may need to re-login for it to take effect."
+      COMPOSE_CMD="${SUDO} ${COMPOSE_CMD}"
+    elif ! docker info >/dev/null 2>&1; then
+      COMPOSE_CMD="${SUDO} ${COMPOSE_CMD}"
+    fi
   fi
 
   log "Using compose command: ${COMPOSE_CMD}"
@@ -95,25 +98,27 @@ EOF
 
 start_stack() {
   log "Starting 3x-ui with Docker Compose ..."
-  (
-    cd "${INSTALL_DIR}"
-    ${COMPOSE_CMD} up -d
-  )
+  # shellcheck disable=SC2086
+  ( cd "${INSTALL_DIR}" && ${COMPOSE_CMD} up -d )
+}
+
+container_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx '3x-ui' \
+    || ${SUDO} docker ps --format '{{.Names}}' 2>/dev/null | grep -qx '3x-ui'
 }
 
 wait_for_container() {
-  local retries=30
-  local i=1
+  retries=30
+  i=1
   log "Waiting for container 3x-ui to become ready ..."
-  while (( i <= retries )); do
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx '3x-ui' \
-      || ${SUDO} docker ps --format '{{.Names}}' 2>/dev/null | grep -qx '3x-ui'; then
+  while [ "$i" -le "$retries" ]; do
+    if container_running; then
       # Give the app a moment to initialize DB
       sleep 3
       return 0
     fi
     sleep 2
-    ((i++))
+    i=$((i + 1))
   done
   echo "Container 3x-ui did not start in time." >&2
   exit 1
@@ -122,22 +127,32 @@ wait_for_container() {
 set_credentials() {
   # Official image does not support username/password via env;
   # set them with the built-in CLI after startup.
-  local docker_bin="docker"
-  if ! docker ps >/dev/null 2>&1; then
-    docker_bin="${SUDO} docker"
+  if docker ps >/dev/null 2>&1; then
+    DOCKER_BIN="docker"
+  else
+    DOCKER_BIN="${SUDO} docker"
   fi
 
   log "Setting panel credentials (user=${XUI_USERNAME}) ..."
-  ${docker_bin} exec 3x-ui /app/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}" \
-    || ${docker_bin} exec 3x-ui /usr/local/x-ui/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"
+  # shellcheck disable=SC2086
+  if ! ${DOCKER_BIN} exec 3x-ui /app/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"; then
+    # shellcheck disable=SC2086
+    ${DOCKER_BIN} exec 3x-ui /usr/local/x-ui/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"
+  fi
 
-  ${docker_bin} restart 3x-ui >/dev/null
+  # shellcheck disable=SC2086
+  ${DOCKER_BIN} restart 3x-ui >/dev/null
   log "Credentials applied and container restarted."
 }
 
 print_summary() {
-  local ip
-  ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo '<server-ip>')"
+  ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [ -z "$ip" ]; then
+    ip="<server-ip>"
+  fi
 
   cat <<EOF
 
@@ -153,14 +168,10 @@ Password  : ${XUI_PASSWORD}
 EOF
 }
 
-main() {
-  need_root_or_sudo
-  install_docker
-  create_compose_project
-  start_stack
-  wait_for_container
-  set_credentials
-  print_summary
-}
-
-main "$@"
+need_root_or_sudo
+install_docker
+create_compose_project
+start_stack
+wait_for_container
+set_credentials
+print_summary
