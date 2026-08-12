@@ -27,7 +27,20 @@ need_root_or_sudo() {
   fi
 }
 
+prepare_apt_deps() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Installing apt prerequisites (apt-utils, ca-certificates, curl) ..."
+  export DEBIAN_FRONTEND=noninteractive
+  ${SUDO} apt-get update -y
+  ${SUDO} apt-get install -y apt-utils ca-certificates curl
+}
+
 install_docker() {
+  prepare_apt_deps
+
   if command -v docker >/dev/null 2>&1; then
     log "Docker already installed: $(docker --version)"
   else
