@@ -1,14 +1,65 @@
 #!/bin/sh
 set -eu
 
-# Default panel credentials
+# Default panel credentials (override via env or: sh -s -- --username U --password P)
 XUI_USERNAME="${XUI_USERNAME:-admin}"
 XUI_PASSWORD="${XUI_PASSWORD:-admin123}"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/3x-ui}"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+API_TOKEN_FILE="${INSTALL_DIR}/api-token.txt"
+API_TOKEN=""
 SUDO=""
 COMPOSE_CMD=""
+DOCKER_BIN="docker"
+XUI_BIN="/app/x-ui"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  curl -fsSL <install.sh-url> | sh
+  curl -fsSL <install.sh-url> | sh -s -- --username USER --password PASS
+  curl -fsSL <install.sh-url> | XUI_USERNAME=USER XUI_PASSWORD=PASS sh
+
+Env vars:
+  XUI_USERNAME   Panel username (default: admin)
+  XUI_PASSWORD   Panel password (default: admin123)
+  INSTALL_DIR    Install directory (default: $HOME/3x-ui)
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -u|--username)
+        [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
+        XUI_USERNAME="$2"
+        shift 2
+        ;;
+      -p|--password)
+        [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
+        XUI_PASSWORD="$2"
+        shift 2
+        ;;
+      --install-dir)
+        [ "$#" -ge 2 ] || { echo "Missing value for $1" >&2; exit 1; }
+        INSTALL_DIR="$2"
+        COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
+        API_TOKEN_FILE="${INSTALL_DIR}/api-token.txt"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -137,25 +188,64 @@ wait_for_container() {
   exit 1
 }
 
-set_credentials() {
-  # Official image does not support username/password via env;
-  # set them with the built-in CLI after startup.
+resolve_docker_bin() {
   if docker ps >/dev/null 2>&1; then
     DOCKER_BIN="docker"
   else
     DOCKER_BIN="${SUDO} docker"
   fi
+}
+
+resolve_xui_bin() {
+  # shellcheck disable=SC2086
+  if ${DOCKER_BIN} exec 3x-ui test -x /app/x-ui; then
+    XUI_BIN="/app/x-ui"
+  elif ${DOCKER_BIN} exec 3x-ui test -x /usr/local/x-ui/x-ui; then
+    XUI_BIN="/usr/local/x-ui/x-ui"
+  else
+    echo "x-ui binary not found inside container." >&2
+    exit 1
+  fi
+}
+
+xui_exec() {
+  # shellcheck disable=SC2086
+  ${DOCKER_BIN} exec 3x-ui "${XUI_BIN}" "$@"
+}
+
+set_credentials() {
+  # Official image does not support username/password via env;
+  # set them with the built-in CLI after startup.
+  resolve_docker_bin
+  resolve_xui_bin
 
   log "Setting panel credentials (user=${XUI_USERNAME}) ..."
-  # shellcheck disable=SC2086
-  if ! ${DOCKER_BIN} exec 3x-ui /app/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"; then
-    # shellcheck disable=SC2086
-    ${DOCKER_BIN} exec 3x-ui /usr/local/x-ui/x-ui setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"
-  fi
+  xui_exec setting -username "${XUI_USERNAME}" -password "${XUI_PASSWORD}"
 
   # shellcheck disable=SC2086
   ${DOCKER_BIN} restart 3x-ui >/dev/null
   log "Credentials applied and container restarted."
+}
+
+create_api_token() {
+  resolve_docker_bin
+  resolve_xui_bin
+
+  log "Creating API token ..."
+  # Fresh DB: -getApiToken creates a token named "install" and prints plaintext once.
+  token_output="$(xui_exec setting -getApiToken true 2>/dev/null || xui_exec setting -getApiToken 2>/dev/null || true)"
+  API_TOKEN="$(printf '%s\n' "$token_output" | sed -n 's/^[[:space:]]*apiToken:[[:space:]]*//p' | head -n 1 | tr -d '\r')"
+
+  if [ -z "$API_TOKEN" ]; then
+    log "WARN: Could not create/read API token via CLI."
+    log "WARN: Create one manually in Panel → Settings → API Tokens."
+    return 0
+  fi
+
+  umask 077
+  printf '%s\n' "$API_TOKEN" > "${API_TOKEN_FILE}"
+  chmod 600 "${API_TOKEN_FILE}" 2>/dev/null || true
+  log "API token saved to ${API_TOKEN_FILE}"
 }
 
 print_summary() {
@@ -176,15 +266,20 @@ Directory : ${INSTALL_DIR}
 Panel URL : http://${ip}:20530
 Username  : ${XUI_USERNAME}
 Password  : ${XUI_PASSWORD}
+API Token : ${API_TOKEN:-<not created>}
+Token File: ${API_TOKEN_FILE}
 ========================================
 
 EOF
 }
 
+parse_args "$@"
 need_root_or_sudo
 install_docker
 create_compose_project
 start_stack
 wait_for_container
 set_credentials
+wait_for_container
+create_api_token
 print_summary
