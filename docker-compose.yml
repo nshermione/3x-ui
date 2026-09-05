@@ -1,6 +1,6 @@
 services:
   3x-ui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
+    image: ghcr.io/mhsanaei/3x-ui:v3.7.0
     container_name: 3x-ui
     hostname: 3x-ui
     volumes:

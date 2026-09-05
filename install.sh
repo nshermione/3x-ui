@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
 
-# Default panel credentials (override via env or: sh -s -- --username U --password P)
-XUI_USERNAME="${XUI_USERNAME:-admin}"
-XUI_PASSWORD="${XUI_PASSWORD:-admin123}"
+# Default panel credentials (prompted; Enter keeps default. Override via env/flags.)
+DEFAULT_USERNAME="admin"
+DEFAULT_PASSWORD="admin123"
+XUI_USERNAME="${XUI_USERNAME:-$DEFAULT_USERNAME}"
+XUI_PASSWORD="${XUI_PASSWORD:-$DEFAULT_PASSWORD}"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/3x-ui}"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
@@ -20,6 +22,10 @@ Usage:
   curl -fsSL <install.sh-url> | sh
   curl -fsSL <install.sh-url> | sh -s -- --username USER --password PASS
   curl -fsSL <install.sh-url> | XUI_USERNAME=USER XUI_PASSWORD=PASS sh
+
+The script prompts for panel username/password.
+Press Enter to keep the default (admin / admin123).
+Flags and env vars pre-fill those defaults; empty input still uses them.
 
 Env vars:
   XUI_USERNAME   Panel username (default: admin)
@@ -63,6 +69,42 @@ parse_args() {
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+read_tty() {
+  IFS= read -r "$1" < /dev/tty || true
+}
+
+prompt_credentials() {
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    log "No TTY; using default credentials (user=${XUI_USERNAME})"
+    return 0
+  fi
+
+  input=""
+  printf 'Panel username [%s]: ' "${XUI_USERNAME}" > /dev/tty
+  read_tty input
+  if [ -n "${input}" ]; then
+    XUI_USERNAME="${input}"
+  fi
+
+  input=""
+  printf 'Panel password [%s]: ' "${XUI_PASSWORD}" > /dev/tty
+  if stty -echo < /dev/tty 2>/dev/null; then
+    trap 'stty echo < /dev/tty 2>/dev/null || true' INT TERM
+    read_tty input
+    stty echo < /dev/tty 2>/dev/null || true
+    trap - INT TERM
+    printf '\n' > /dev/tty
+  else
+    read_tty input
+  fi
+  if [ -n "${input}" ]; then
+    XUI_PASSWORD="${input}"
+  fi
+  unset input
+
+  log "Using panel username: ${XUI_USERNAME}"
 }
 
 need_root_or_sudo() {
@@ -143,7 +185,7 @@ create_compose_project() {
   cat > "${COMPOSE_FILE}" <<'EOF'
 services:
   3x-ui:
-    image: ghcr.io/mhsanaei/3x-ui:latest
+    image: ghcr.io/mhsanaei/3x-ui:v3.7.0
     container_name: 3x-ui
     hostname: 3x-ui
     volumes:
@@ -274,6 +316,7 @@ EOF
 
 parse_args "$@"
 need_root_or_sudo
+prompt_credentials
 install_docker
 create_compose_project
 start_stack
