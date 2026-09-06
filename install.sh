@@ -1,11 +1,12 @@
 #!/bin/sh
 set -eu
 
-# Default panel credentials (prompted; Enter keeps default. Override via env/flags.)
+# Default panel credentials (prompted unless --no-prompt. Enter keeps default.)
 DEFAULT_USERNAME="admin"
 DEFAULT_PASSWORD="admin123"
 XUI_USERNAME="${XUI_USERNAME:-$DEFAULT_USERNAME}"
 XUI_PASSWORD="${XUI_PASSWORD:-$DEFAULT_PASSWORD}"
+NO_PROMPT="${NO_PROMPT:-0}"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/3x-ui}"
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
@@ -21,16 +22,21 @@ usage() {
 Usage:
   curl -fsSL <install.sh-url> | sh
   curl -fsSL <install.sh-url> | sh -s -- --username USER --password PASS
+  curl -fsSL <install.sh-url> | sh -s -- --no-prompt
+  curl -fsSL <install.sh-url> | sh -s -- --no-prompt --username USER --password PASS
   curl -fsSL <install.sh-url> | XUI_USERNAME=USER XUI_PASSWORD=PASS sh
 
-The script prompts for panel username/password.
+By default the script prompts for panel username/password.
 Press Enter to keep the default (admin / admin123).
 Flags and env vars pre-fill those defaults; empty input still uses them.
+
+--no-prompt skips all prompts and uses flags, env vars, or defaults.
 
 Env vars:
   XUI_USERNAME   Panel username (default: admin)
   XUI_PASSWORD   Panel password (default: admin123)
   INSTALL_DIR    Install directory (default: $HOME/3x-ui)
+  NO_PROMPT      Set to 1 to skip prompts (same as --no-prompt)
 EOF
 }
 
@@ -53,6 +59,10 @@ parse_args() {
         COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
         API_TOKEN_FILE="${INSTALL_DIR}/api-token.txt"
         shift 2
+        ;;
+      --no-prompt)
+        NO_PROMPT=1
+        shift
         ;;
       -h|--help)
         usage
@@ -316,7 +326,11 @@ EOF
 
 parse_args "$@"
 need_root_or_sudo
-prompt_credentials
+if [ "${NO_PROMPT}" = "1" ] || [ "${NO_PROMPT}" = "true" ] || [ "${NO_PROMPT}" = "yes" ]; then
+  log "No-prompt mode; using credentials (user=${XUI_USERNAME})"
+else
+  prompt_credentials
+fi
 install_docker
 create_compose_project
 start_stack
