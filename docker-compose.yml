@@ -12,4 +12,5 @@ services:
     restart: unless-stopped
     ports:
       - "20530:2053"
-      - "443:443"
+      - "443:443/tcp"
+      - "443:443/udp"
