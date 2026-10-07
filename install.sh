@@ -7,6 +7,11 @@ DEFAULT_PASSWORD="admin123"
 XUI_USERNAME="${XUI_USERNAME:-$DEFAULT_USERNAME}"
 XUI_PASSWORD="${XUI_PASSWORD:-$DEFAULT_PASSWORD}"
 PROTOCOL_DOMAIN="${PROTOCOL_DOMAIN:-}"
+SERVER_IP=""
+CERT_SUBJECT=""
+FALLBACK_CERT_NAME="localhost"
+IP_LOOKUP_URL="https://ifconfig.me"
+IP_LOOKUP_TIMEOUT_SECONDS="10"
 DEFAULT_PANEL_PORT="20530"
 DEFAULT_PROTOCOL_PORT="443"
 PANEL_PORT="${PANEL_PORT:-$DEFAULT_PANEL_PORT}"
@@ -35,14 +40,15 @@ Usage:
 
 By default the script prompts for panel username/password, the protocol domain, and ports.
 Press Enter to keep the default username/password (admin / admin123) and ports (20530, 443).
-The protocol domain has no default; --no-prompt requires --protocol-domain or PROTOCOL_DOMAIN.
+The protocol domain is optional; leave it empty to issue the certificate for the server's public IP.
 Flags and env vars pre-fill those defaults; empty input still uses them.
 
 --no-prompt skips all prompts and uses flags, env vars, or defaults.
 
 The protocol domain is the TLS name shared by inbounds (Hysteria2, Trojan, VLESS, VMess, TUIC).
 It is separate from the panel. A self-signed certificate is written to
-<install-dir>/cert/hysteria.crt and hysteria.key.
+<install-dir>/cert/hysteria.crt and hysteria.key, for the protocol domain if set,
+otherwise for the server's public IP (or localhost if the IP cannot be detected).
 
 Published ports in docker-compose.yml:
   PANEL_PORT:2053                 panel (default host port 20530)
@@ -52,7 +58,7 @@ Published ports in docker-compose.yml:
 Env vars:
   XUI_USERNAME      Panel username (default: admin)
   XUI_PASSWORD      Panel password (default: admin123)
-  PROTOCOL_DOMAIN   Protocol TLS domain, cert CN/SAN (required)
+  PROTOCOL_DOMAIN   Protocol TLS domain, cert CN/SAN (optional; default: server public IP)
   PANEL_PORT        Host port for the panel (default: 20530)
   PROTOCOL_PORT     Host and container port for protocols, TCP and UDP (default: 443)
   EXTRA_PORTS       Space-separated extra mappings, same form as --publish
@@ -158,10 +164,9 @@ prompt_credentials() {
   log "Using panel username: ${XUI_USERNAME}"
 }
 
-require_protocol_domain() {
+validate_protocol_domain() {
   if [ -z "${PROTOCOL_DOMAIN}" ]; then
-    echo "Protocol domain is required. Pass --protocol-domain or set PROTOCOL_DOMAIN." >&2
-    exit 1
+    return 0
   fi
   if ! printf '%s' "${PROTOCOL_DOMAIN}" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'; then
     echo "Invalid protocol domain: ${PROTOCOL_DOMAIN}" >&2
@@ -169,26 +174,44 @@ require_protocol_domain() {
   fi
 }
 
+describe_protocol_domain() {
+  printf '%s' "${PROTOCOL_DOMAIN:-<none, using server IP>}"
+}
+
 prompt_protocol_domain() {
   if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
-    require_protocol_domain
-    log "No TTY; using protocol domain: ${PROTOCOL_DOMAIN}"
+    validate_protocol_domain
+    log "No TTY; using protocol domain: $(describe_protocol_domain)"
     return 0
   fi
 
   input=""
-  if [ -n "${PROTOCOL_DOMAIN}" ]; then
-    printf 'Protocol domain [%s]: ' "${PROTOCOL_DOMAIN}" > /dev/tty
-  else
-    printf 'Protocol domain: ' > /dev/tty
-  fi
+  printf 'Protocol domain [%s]: ' "${PROTOCOL_DOMAIN:-none, use server IP}" > /dev/tty
   read_tty input
   if [ -n "${input}" ]; then
     PROTOCOL_DOMAIN="${input}"
   fi
   unset input
-  require_protocol_domain
-  log "Using protocol domain: ${PROTOCOL_DOMAIN}"
+  validate_protocol_domain
+  log "Using protocol domain: $(describe_protocol_domain)"
+}
+
+is_ip_address() {
+  printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$'
+}
+
+detect_server_ip() {
+  if [ -n "${SERVER_IP}" ]; then
+    return 0
+  fi
+  candidate="$(curl -fsSL --max-time "${IP_LOOKUP_TIMEOUT_SECONDS}" "${IP_LOOKUP_URL}" 2>/dev/null || true)"
+  if ! is_ip_address "${candidate}"; then
+    candidate="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if is_ip_address "${candidate}"; then
+    SERVER_IP="${candidate}"
+  fi
+  unset candidate
 }
 
 validate_port_number() {
@@ -410,8 +433,28 @@ ${ports_block}
 EOF
 }
 
+resolve_cert_subject() {
+  if [ -n "${PROTOCOL_DOMAIN}" ]; then
+    CERT_SUBJECT="${PROTOCOL_DOMAIN}"
+    cert_san="DNS:${PROTOCOL_DOMAIN}"
+    return 0
+  fi
+
+  detect_server_ip
+  if [ -n "${SERVER_IP}" ]; then
+    CERT_SUBJECT="${SERVER_IP}"
+    cert_san="IP:${SERVER_IP}"
+    return 0
+  fi
+
+  log "WARN: Could not detect server IP; issuing certificate for ${FALLBACK_CERT_NAME}."
+  CERT_SUBJECT="${FALLBACK_CERT_NAME}"
+  cert_san="DNS:${FALLBACK_CERT_NAME}"
+}
+
 generate_self_cert() {
-  require_protocol_domain
+  validate_protocol_domain
+  resolve_cert_subject
   if ! command -v openssl >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
       log "Installing openssl ..."
@@ -426,12 +469,13 @@ generate_self_cert() {
 
   cert_dir="${INSTALL_DIR}/cert"
   mkdir -p "${cert_dir}"
-  log "Generating self-signed certificate for protocol domain ${PROTOCOL_DOMAIN} ..."
+  log "Generating self-signed certificate for ${CERT_SUBJECT} (${cert_san}) ..."
   openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
     -keyout "${cert_dir}/hysteria.key" \
     -out "${cert_dir}/hysteria.crt" \
-    -subj "/CN=${PROTOCOL_DOMAIN}" \
-    -addext "subjectAltName=DNS:${PROTOCOL_DOMAIN}"
+    -subj "/CN=${CERT_SUBJECT}" \
+    -addext "subjectAltName=${cert_san}"
+  unset cert_san
   chmod 600 "${cert_dir}/hysteria.key" 2>/dev/null || true
   log "Certificate written to ${cert_dir}/hysteria.crt"
 }
@@ -525,13 +569,8 @@ create_api_token() {
 }
 
 print_summary() {
-  ip="$(curl -fsSL https://ifconfig.me 2>/dev/null || true)"
-  if [ -z "$ip" ]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  fi
-  if [ -z "$ip" ]; then
-    ip="<server-ip>"
-  fi
+  detect_server_ip
+  ip="${SERVER_IP:-<server-ip>}"
 
   cat <<EOF
 
@@ -542,7 +581,8 @@ Directory : ${INSTALL_DIR}
 Panel URL : http://${ip}:${PANEL_PORT}
 Username  : ${XUI_USERNAME}
 Password  : ${XUI_PASSWORD}
-Protocol domain : ${PROTOCOL_DOMAIN}
+Protocol domain : ${PROTOCOL_DOMAIN:-<none>}
+Cert subject    : ${CERT_SUBJECT}
 Protocol port   : ${PROTOCOL_PORT}/tcp+udp
 Extra ports     : ${EXTRA_PORTS:-<none>}
 Cert      : ${INSTALL_DIR}/cert/hysteria.crt
@@ -557,9 +597,9 @@ EOF
 parse_args "$@"
 need_root_or_sudo
 if [ "${NO_PROMPT}" = "1" ] || [ "${NO_PROMPT}" = "true" ] || [ "${NO_PROMPT}" = "yes" ]; then
-  require_protocol_domain
+  validate_protocol_domain
   require_ports
-  log "No-prompt mode; using credentials (user=${XUI_USERNAME}), protocol domain ${PROTOCOL_DOMAIN}, panel port ${PANEL_PORT}, protocol port ${PROTOCOL_PORT}"
+  log "No-prompt mode; using credentials (user=${XUI_USERNAME}), protocol domain $(describe_protocol_domain), panel port ${PANEL_PORT}, protocol port ${PROTOCOL_PORT}"
 else
   prompt_credentials
   prompt_protocol_domain
